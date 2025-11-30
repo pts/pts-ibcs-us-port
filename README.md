@@ -32,3 +32,10 @@ Linux i386 (or Linux amd64) system, and run `./compile_4.1.6.sh` and/oor
 `./compile_4.2.1.sh`. These shell scripts will download all dependences, run
 the compilation, and create the output ELF-32 executable program files in
 the directory *out*.
+
+Before run ibcs-us as non-root, you have to add the CAP_SYS_RAWIO capability
+to the executable program file. Without this capability, ibcs-us won't be
+able to memory-map (mmap(2)) the Unix program to run to a low enough virtual
+address. To do so, run `sudo setcap cap_sys_rawio+ep out/ibcs-us-4.2.1`.
+Alternatively, if you don't have the *setcap* tool installed, run `sudo
+out/ibcs-us-4.2.1 -s`
