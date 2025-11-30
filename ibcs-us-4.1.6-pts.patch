@@ -1,0 +1,355 @@
+--- Makefile.defs.orig	2021-08-25 06:08:37.000000000 +0200
++++ Makefile.defs	2025-11-29 18:43:50.072055347 +0100
+@@ -77,7 +77,7 @@
+ #
+ COMPONENT_OBJECTS := $(patsubst %.c, $(COMPONENT_BUILD_DIR)/%.o, $(COMPONENT_SOURCES))
+ $(COMPONENT_OBJ): $(COMPONENT_OBJECTS) | $$(@D)
+-	$(CC) $(CFLAGS) -nostdlib -no-pie -Wl,-z,now -Wl,-r -o $@ $(COMPONENT_OBJECTS)
++	$(CC) $(CFLAGS) -nostdlib -Wl,-z,now -Wl,-r -o $@ $(COMPONENT_OBJECTS)
+ 
+ $(COMPONENT_BUILD_DIR)/%.o: %.c $(COMPONENT_BUILD_DIR)/%.c.deps | $$(@D)
+ 	$(CC) $(CFLAGS) -MMD -MP -MT $@ -MF $(@:.o=.c.deps.tmp) -c -o $@ ./$(@F:.o=.c)
+--- binfmt-elf/binfmt_elf.c.orig	2021-08-25 06:08:37.000000000 +0200
++++ binfmt-elf/binfmt_elf.c	2025-11-29 22:57:14.244777008 +0100
+@@ -108,6 +108,8 @@
+ 	return 0;
+ }
+ 
++static unsigned get_buf9(const char *buf) { return ((const unsigned*)buf)[9]; }
++
+ 
+ /*
+  * Guess the personality.
+@@ -117,7 +119,7 @@
+ {
+ 	long lPers, nPers;
+ 
+-	switch (((unsigned*)binprm->buf)[9]) {
++	switch (get_buf9(binprm->buf)) {  /* Using a function call here to avoid gcc-4.8 warning: dereferencing type-punned pointer will break strict-aliasing rules [-Werror=strict-aliasing] */
+ 		case 0x314B4455U:
+ 			lPers = PER_UW7;
+ 			break;
+--- ibcs/linux26-compat.c.orig	2021-08-25 06:08:37.000000000 +0200
++++ ibcs/linux26-compat.c	2025-11-30 00:08:02.046523777 +0100
+@@ -4,6 +4,7 @@
+  *
+  * This emulates the kernel 2.6.32 ABI with normal system calls.
+  */
++
+ #include <linux/elf.h>
+ #include <linux/futex.h>
+ 
+@@ -1254,7 +1255,7 @@
+ int linux26_capability(unsigned int flag, int action)
+ {
+     struct __user_cap_header_struct	hdr;
+-    struct __user_cap_data_struct	caps[VFS_CAP_U32_3] = { 0 }; /* Shutup gcc warning */
++    struct __user_cap_data_struct	caps[VFS_CAP_U32_3] = { { 0 } }; /* Shutup gcc warning */
+     int					retval;
+     u64					old_effective;
+     u64					new_effective;
+@@ -1292,6 +1293,8 @@
+     return new_effective & cap_bit;
+ }
+ 
++extern void (*__init_array_start[])(void);  /* Symbol created by GNU ld(1). */
++extern void (*__init_array_end  [])(void);  /* Symbol created by GNU ld(1). */
+ 
+ /*
+  * The modues implementing the personalities for this program were in a past
+@@ -1309,101 +1312,11 @@
+  *
+  * Our task here is to extract those function pointers and call them.
+  */
+-static void module_initialise(void);
+-
+-__attribute__((section(".module_initialise_reloc"))) void (*module_initialise_reloc)() = module_initialise;
+-
+-static void module_initialise()
++static void module_initialise(void)
+ {
+-    const Elf32_Ehdr*	ehdr;
+-    const char*		exe_filename_fmt = "/proc/%d/exe";
+-    int			exe_filename_size = ibcs_fmt((char*)0, 0, exe_filename_fmt, current->pid);
+-    char		exe_filename[exe_filename_size];
+-    struct file*	exe_file;
+-    long		exe_map_size;
+-    int			init_idx;
+-    int			init_sh_no;
+-    struct kstat	kstat;
+-    size_t		reloc;
+-    int			reloc_sh_no;
+-    int			ret;
+-    int			sh_no;
+-    const Elf32_Shdr*	shdr;
+-    const char*		strings;
++    void (**fp)(void);
+ 
+-    /*
+-     * The first step if to open our executable and map it into memory.
+-     * It is an ELF format file, of course.
+-     */
+-    sprintf(exe_filename, exe_filename_fmt, current->pid);
+-    exe_file = linux26_fopen(exe_filename, O_RDONLY);
+-    if (IBCS_IS_ERR(exe_file)) {
+-	ibcs_fatal_syscall((int)exe_file, "module_initialise open(\"%s\")", exe_filename);
+-    }
+-    ret = vfs_fstat(exe_file->fd, &kstat);
+-    if (IBCS_IS_ERR(ret)) {
+-	ibcs_fatal_syscall(ret, "module_initialise stat(\"%s\")", exe_filename);
+-    }
+-    exe_map_size = PAGE_ALIGN(kstat.size);
+-    ehdr = (const Elf32_Ehdr*)do_mmap(
+-	exe_file, 0, exe_map_size, PROT_READ, MAP_PRIVATE | MAP_32BIT, 0);
+-    if (IBCS_IS_ERR(ehdr)) {
+-	ibcs_fatal_syscall((int)ehdr, "module_initialise mmap(\"%s\")", exe_filename);
+-    }
+-    if (ehdr->e_shoff == 0) {
+-        goto out;
+-    }
+-    /*
+-     * The next step is to find the two ELF sections we need:
+-     *     .init_array, created when gcc sees __attribute__((constructor))
+-     *     .module_initialise_reloc, which is created above.
+-     */
+-    shdr = (const Elf32_Shdr*)((const char*)ehdr + ehdr->e_shoff);
+-    strings = (const char*)ehdr + shdr[ehdr->e_shstrndx].sh_offset;
+-    init_sh_no = -1;
+-    reloc_sh_no = -1;
+-    for (sh_no = 0;  sh_no < ehdr->e_shnum; sh_no += 1) {
+-	if (!strcmp(".module_initialise_reloc", &strings[shdr[sh_no].sh_name])) {
+-	   reloc_sh_no = sh_no;
+-	}
+-	if (!strcmp(".init_array", &strings[shdr[sh_no].sh_name])) {
+-	   init_sh_no = sh_no;
+-	}
+-    }
+-    if (init_sh_no == -1) {
+-        goto out;
+-    }
+-    if (reloc_sh_no == -1) {
+-        ibcs_fatal("internal error: can not find elf section 'module_initialise_reloc'\n");
+-    }
+-    /*
+-     * The kernel has loaded the ELF file at some random address in memory,
+-     * which means all the code in the ELF file has been relocated by an
+-     * unknown amount.  This means functions pointed to by the .init_array
+-     * also have to relocated by that same unknown amount which makes the raw
+-     * pointers in the ELF file useless.
+-     *
+-     * However, everything has been relocated by that amount, including this
+-     * function.  So above we arrange for a pointer to this function to be
+-     * stored in the ELF file, and now we can compare to what is in the ELF
+-     * file to its actual address to derive how far everything has been
+-     * relocated.
+-     */
+-    reloc =
+-	(size_t)module_initialise -
+-	*(size_t*)((char*)ehdr + shdr[reloc_sh_no].sh_offset);
+-    /*
+-     * Yak shaving done, we can finally call all the module initialisation
+-     * functions declared with module_init() macro in linix/modules.h.
+-     */
+-    char** init_array = (char**)((char*)ehdr + shdr[init_sh_no].sh_offset);
+-    int init_count = shdr[init_sh_no].sh_size / sizeof(*init_array);
+-    for (init_idx = 0; init_idx < init_count; init_idx += 1) {
+-	(*(void (*)(void))(init_array[init_idx] + reloc))();
+-    }
+-out:
+-    do_munmap(current->mm, (unsigned long)ehdr, exe_map_size);
+-    linux26_fclose(exe_file);
++    for (fp = __init_array_start; fp != __init_array_end; fp++[0]()) {}
+ }
+ 
+ 
+@@ -1413,6 +1326,7 @@
+ void linux26_compat_init(const char* ibcs_program_name)
+ {
+     struct utsname	uts;
++    int i;
+ 
+     init_rwsem(&current->mm->mmap_sem);
+     init_rwsem(&uts_sem);
+@@ -1433,7 +1347,7 @@
+     strncpy(current->comm, ibcs_program_name, sizeof(current->comm) - 1);
+     current->comm[sizeof(current->comm) - 1] = '\0';
+     current->files->fdt = &current->files->fdtab;
+-    for (int i = 1; i < ARRAY_SIZE(current->_linux26_sigtab); i += 1) {
++    for (i = 1; i < ARRAY_SIZE(current->_linux26_sigtab); i += 1) {
+         IBCS_SYSCALL(
+ 	    sigaction, i, (struct sigaction*)0, &current->_linux26_sigtab[i]);
+     }
+--- ibcs/main.c.orig	2021-08-25 06:08:37.000000000 +0200
++++ ibcs/main.c	2025-11-29 23:28:39.962114229 +0100
+@@ -73,6 +73,7 @@
+         ibcs_writef(2, "  -l L, --log=L        Where to write printk output, like trace.\n");
+         ibcs_writef(2, "  -m M, --map=M        Rewrite filenames using map file M.\n");
+         ibcs_writef(2, "  -p P, --personality=P Emulate personality P.\n");
++        ibcs_writef(2, "  -s, --setcap         Add capabilities to program file argv[0].\n");
+         ibcs_writef(2, "  -t T, --trace=T      Set tracing bits to T.\n");
+     }
+     IBCS_SYSCALL(exit, 1);
+@@ -354,6 +355,7 @@
+     "-h",	"--help",
+     "-m=",	"--map=",
+     "-p=",	"--personality=",
++    "-s",	"--setcap",
+     "-t=",	"--trace=",
+     (char*)0
+ };
+@@ -367,6 +369,7 @@
+     const char*		end;
+     const char*		option;
+     int			optindex = 0;
++    int got;
+ 
+     memset(cmdline_options, '\0', sizeof(*cmdline_options));
+     cmdline_options->argv0 = *argv;
+@@ -406,6 +409,15 @@
+ 	    cmdline_options->abi_trage_flg = lookup_flag(
+ 		cmdline_options->me, arg, trace_flags_table, option);
+ 	}
++	if (!strcmp(option, "-s") || !strcmp(option, "--setcap")) {
++		/* CAP_SYS_RAWIO is needed for low-vaddr-mmap(2). */
++        	/* The \2 in the 2nd dword corresponds to 1U << CAP_SYS_RAWIO == 1U << 17 == 0x200000U. */
++        	/* sudo setcap cap_sys_rawio+ep build/ibcs-us */
++        	if ((got = IBCS_SYSCALL(setxattr, cmdline_options->argv0, "security.capability", "\1\0\0\2\0\0\2\0\0\0\0\0\0\0\0\0\0\0\0", 20, 0)) != 0) {
++			ibcs_fatal_syscall(got, "error setting CAP_SYS_RAWIO; maybe use sudo?");
++		}
++	        IBCS_SYSCALL(exit, 0);
++	}
+     }
+     if (*argv == (char*)0) {
+         usage(cmdline_options->me, (char*)0);
+@@ -610,7 +622,7 @@
+     if ((int)IBCS_SYSCALL(geteuid32) != 0) {
+ 	if (!linux26_capability(CAP_SYS_RAWIO, 0)) {
+ 	    ibcs_writef(
+-		2, "%s: I must be run as root or have SYS_CAP_RAWIO.\n",
++		2, "%s: I must be run as root or have CAP_SYS_RAWIO.\n",
+ 		cmdline_options.me);
+ 	    IBCS_SYSCALL(exit, 1);
+ 	}
+--- ibcs/sysent.c.orig	2021-08-25 06:08:37.000000000 +0200
++++ ibcs/sysent.c	2025-11-29 22:50:52.626877712 +0100
+@@ -19,6 +19,11 @@
+ 
+ #define	__sigset_t_defined	1
+ #define __stack_t_defined	1
++
++#ifndef _SIGSET_NWORDS
++#  define _SIGSET_NWORDS (1024 / (8 * sizeof (unsigned long int)))
++  typedef struct { unsigned long int __val[_SIGSET_NWORDS]; } __sigset_t;
++#endif
+ /*#include <bits/sigset.h>	// this has goneski's in buster */
+ #define	_SIGNAL_H		/* We don't want glibc'c include/signal.h */
+ #define __USE_GNU		/* for mcontext->gregs[REG_XXX] definitions */
+@@ -229,6 +234,12 @@
+     return result;
+ }
+ 
++#ifdef __pic__  /* gcc -fpic; without gcc -fno-pic */
++  struct task_struct *get_current(void) { return current; }  /* Uses `call __x86.get_pc_thunk.ax ++ addl $_GLOBAL_OFFSET_TABLE_, %%eax' with `gcc -fpic'. */
++#else
++#  define get_current() current
++#endif
++
+ 
+ /*
+  * Entry point for lcall syscalls.
+@@ -342,11 +353,6 @@
+      *
+      * Notice this is _very_ compiler dependent.
+      */
+-    asm volatile (
+-	"call	__x86.get_pc_thunk.ax\n"
+-	"addl	$_GLOBAL_OFFSET_TABLE_,%%eax\n"
+-	:
+-    );
+     /*
+      * Now gcc's GOT pointer is set up we can ask it to load "current" for us.
+      */
+@@ -357,7 +363,7 @@
+ 	"call	*%0\n"			/* (*%eax)(lcall_gate, regs) */
+ 	"addl	$8,%%esp\n"
+ 	:
+-	: "a" (current->exec_domain->handler)
++	: "a" (get_current()->exec_domain->handler)
+     );
+     /*
+      * The handler has set the struct pt_regs we passed him to contain the
+--- include/ibcs-us/linux26-compat/linux/capability.h.orig	2021-08-25 06:08:36.000000000 +0200
++++ include/ibcs-us/linux26-compat/linux/capability.h	2025-11-29 19:00:20.201703416 +0100
+@@ -16,6 +16,10 @@
+ #include <ibcs-us/linux26-compat/linux/errno.h>
+ #include <ibcs-us/linux26-compat/linux/types.h>
+ 
++#ifndef   VFS_CAP_U32_3
++#  define VFS_CAP_U32_3 3
++#endif
++
+ #define cap_raise(c, flag)  linux26_capability(flag, 1)
+ #define cap_lower(c, flag)  linux26_capability(flag, -1)
+ #define cap_raised(c, flag) linux26_capability(flag, 0)
+--- include/ibcs-us/ibcs/ibcs-lib.h.orig	2021-08-25 06:08:36.000000000 +0200
++++ include/ibcs-us/ibcs/ibcs-lib.h	2025-11-29 19:01:44.395477659 +0100
+@@ -13,6 +13,16 @@
+ 
+ #include <ibcs-us/linux26-compat/linux/types.h>
+ 
++#ifndef   __NR_getsockopt
++  #define __NR_getsockopt 365
++#endif
++#ifndef   __NR_sendmsg
++  #define __NR_sendmsg 370
++#endif
++#ifndef   __NR_recvmsg
++  #define __NR_recvmsg 372
++#endif
++
+ #define ARRAY_END(x)	(&(x)[sizeof(x) / sizeof(*(x))])
+ #define	IBCS_SYSCALL(name, args...) ibcs_syscall(__NR_##name, ##args)
+ #define	IBCS_IS_ERR(x)	((size_t)(x) > (size_t)-4096)
+--- per-svr4/socksys.c.orig	2021-08-25 06:08:37.000000000 +0200
++++ per-svr4/socksys.c	2025-11-29 19:13:00.647980737 +0100
+@@ -84,7 +84,7 @@
+  * This gets filled in on module initialization.
+  */
+ static struct file_operations socksys_socket_fops = {
+-	/* NOTHING */
++	0 /* NOTHING */
+ };
+ 
+ /*
+--- per-svr4/xti.c.orig	2021-08-25 06:08:37.000000000 +0200
++++ per-svr4/xti.c	2025-11-30 01:31:06.121459121 +0100
+@@ -1176,8 +1176,7 @@
+ #if defined(CONFIG_ABI_TRACE)
+ 			abi_trace(ABI_TRACE_STREAMS, "disconnect %u\n", fd);
+ #endif
+-			/* Fall through... */
+-			__attribute__((fallthrough));
++			/* Fallthrough. */  /* __attribute__((fallthrough)); */
+ 		}
+ 		case T_ORDREL_REQ: {
+ 			SYS(close,fd);
+--- per-wyse/socket.c.orig	2021-08-25 06:08:37.000000000 +0200
++++ per-wyse/socket.c	2025-11-29 19:16:21.353433086 +0100
+@@ -139,7 +139,7 @@
+ 				return -EINVAL;
+ 			break;
+ 		}
+-		__attribute__ ((fallthrough));
++		/* Fallthrough. */  /* __attribute__((fallthrough)); */
+ 	case 0xffff:
+ 		level = SOL_SOCKET;
+ 		optname = map_value(current_thread_info()->exec_domain->sockopt_map, optname, 0);
+@@ -222,7 +222,7 @@
+ 				return -EINVAL;
+ 			break;
+ 		}
+-		__attribute__ ((fallthrough));
++		/* Fallthrough. */  /* __attribute__((fallthrough)); */
+ 	case 0xffff:
+ 		level = SOL_SOCKET;
+ 		optname = map_value(current_thread_info()->exec_domain->sockopt_map, optname, 0);

@@ -2,4 +2,10 @@
 *.o
 /sysinclude
 /ibcs-us-*.tar.gz
+/ibcs-us-*.tar.gz.tmp
+/ibcs-us-4.[0-9].[0-9]/
+/minilibc686-master/
+/minilibc686-master.tar.gz
+/true.c
+/true
 /out/
