@@ -1,0 +1,5 @@
+*~
+*.o
+/sysinclude
+/ibcs-us-*.tar.gz
+/out/
